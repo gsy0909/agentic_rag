@@ -1,6 +1,6 @@
 defaults:
   - model: qwen
-  - dataset: full
+  - dataset: toy_dataset_100
   - search: default
   - _self_
 

@@ -33,4 +33,18 @@ ontology:
   min_cluster_k: 10
   max_cluster_k: 60
   min_docs_to_split: 100
-ontology_enabled: false
+ontology_enabled: true
+
+# --- Compression module (plug-and-play) ---
+# Set enabled: true to activate pre-compression before the Verifier.
+# hard_method: 'embedding' uses sentence-level cosine filtering (RECOMP-style, no extra deps).
+#              'llmlingua' uses token-level perplexity filtering (requires: pip install llmlingua).
+compression:
+  enabled: false
+  hard_method: "embedding"      # embedding | cross_encoder | llmlingua
+  similarity_threshold: 0.3     # [embedding] cosine cutoff; [cross_encoder] score cutoff (0.0–1.0)
+  cross_encoder_model: "BAAI/bge-reranker-v2-m3"  # [cross_encoder] HuggingFace model ID
+  compression_rate: 0.5         # [llmlingua] fraction of tokens to retain
+  skip_short_docs: 150          # docs with fewer words than this are passed through unchanged
+  embedding_batch_size: 32      # [embedding] sentences per GPU batch; lower this if OOM
+  local_model_dir: "models/llmlingua2"  # [llmlingua] local cache path; downloaded from HuggingFace on first use

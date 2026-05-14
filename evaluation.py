@@ -22,8 +22,8 @@ logger = setup_logger(__name__)
 
 KS = [1, 5, 10, 20]
 LLM_ACC_PROMPT_TEMPLATE = """
-You are an expert evaluator. Your task is to determine if the predicted answer is correct based on the question and gold answer.
-The criteria should be reasonable, not too strict or too lenient.
+You are a professional evaluator. Your task is to determine whether the predicted answer is correct based on the question and the actual answer.
+The evaluation criteria should be reasonable and not overly strict. As long as the meaning is correct, or if the relevant statement has been mentioned, it is acceptable.
 
 Question: {question}
 Gold Answer: {gold_answer}
@@ -175,7 +175,7 @@ async def evaluate_llm_acc(
     output_dir: str,
 ) -> Optional[Dict[str, Any]]:
     queries_path = resolve_dataset_file(dataset_dir, "queries.jsonl", "queries*.jsonl")
-    gold_answers_path = resolve_dataset_file(dataset_dir, "final_answer.jsonl", "final_answer*.jsonl")
+    gold_answers_path = resolve_dataset_file(dataset_dir, "answers.jsonl", "final_answer*.jsonl")
 
     if not os.path.exists(gold_answers_path):
         logger.warning("Gold answers file not found at %s; skipping llm-acc evaluation.", gold_answers_path)

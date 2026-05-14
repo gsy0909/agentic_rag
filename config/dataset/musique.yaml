@@ -1,0 +1,2 @@
+name: musique
+path: ${hydra:runtime.cwd}/datasets/musique

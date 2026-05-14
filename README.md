@@ -28,6 +28,8 @@ OmniSearch is a sophisticated Agentic RAG framework designed for complex informa
 
 ## Usage
 
+source /root/autodl-tmp/agentic_rag/.venv/bin/activate
+
 1. Set your API key:
    ```bash
    export QWEN_API_KEY=your_api_key
@@ -38,6 +40,9 @@ OmniSearch is a sophisticated Agentic RAG framework designed for complex informa
    python main.py
    ```
 
+streamlit run app.py
+
 ## Configuration
 
 Modify `config/config.yaml` and the files in `config/` to adjust model parameters, search settings, and dataset paths.
+

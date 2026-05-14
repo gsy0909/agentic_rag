@@ -1,5 +1,5 @@
 llm_name: qwen3.5-flash
-embedding_name: qwen/qwen3-embedding-0.6B
+embedding_name: /root/autodl-tmp/LightRAG/models/Qwen3-Embedding-0.6B
 embedding_dim: 1024
-base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+base_url: https://www.packyapi.com/v1
 api_key: ${oc.env:QWEN_API_KEY,""}

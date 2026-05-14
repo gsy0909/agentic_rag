@@ -87,7 +87,16 @@ class OmniSearch:
         )
         self.verifier = Verifier(self.llm_client)
         self.reflector = Reflector(self.llm_client)
-        
+
+        # --- Compression module (plug-and-play) ---
+        # Disabled by default. Enable via config: compression.enabled: true
+        # When disabled, this block is fully skipped and the pipeline is unchanged.
+        compression_cfg = config.get('search', {}).get('compression', {})
+        self.compression_enabled = bool(compression_cfg.get('enabled', False))
+        if self.compression_enabled:
+            from ..compression.compressor import ContextCompressor
+            self.compressor = ContextCompressor(self.embedding_model, compression_cfg)
+
         self.max_turns = config['search'].get('max_turns', 3)
 
     async def build_indices(self, corpus: List[Dict[str, Any]]):
@@ -122,14 +131,47 @@ class OmniSearch:
             force=force_rebuild_ontology,
         )
 
-    async def search(self, query: str, request_id: Optional[str] = None) -> Dict[str, Any]:
-        """Perform agentic multi-turn search."""
+    def update_search_params(
+        self,
+        max_turns: Optional[int] = None,
+        weights: Optional[Dict[str, float]] = None,
+        concept_bonus: Optional[float] = None,
+        rrf_k: Optional[int] = None,
+        ontology_enabled: Optional[bool] = None,
+        compression_enabled: Optional[bool] = None,
+    ) -> None:
+        """Update search parameters at runtime (for UI use). Does not affect index or model."""
+        from ..search.ranker import HybridRanker
+        if max_turns is not None:
+            self.max_turns = max_turns
+        if ontology_enabled is not None:
+            self.ontology_enabled = ontology_enabled
+        if compression_enabled is not None:
+            self.compression_enabled = compression_enabled
+        if any(x is not None for x in [weights, concept_bonus, rrf_k]):
+            self.ranker = HybridRanker(
+                weights=weights if weights is not None else self.ranker.weights,
+                concept_bonus=concept_bonus if concept_bonus is not None else self.ranker.concept_bonus,
+                rrf_k=rrf_k if rrf_k is not None else self.ranker.rrf_k,
+            )
+
+    async def search(self, query: str, request_id: Optional[str] = None, trace_mode: bool = False) -> Dict[str, Any]:
+        """Perform agentic multi-turn search.
+
+        Args:
+            trace_mode: When True (UI use), collects enriched per-subquery trace data
+                        (retrieval counts, ranked docs, compression stats) and returns it
+                        as ``turn_details`` in the result dict. Has zero effect on JSONL
+                        output files or any other behavior when False (default).
+        """
         current_query = query
         turn = 0
         all_evidences = []
         all_doc_ids = set()
         trace_queries: List[str] = []
         turn_trace_details: List[Dict[str, Any]] = []
+        compression_log: List[Dict[str, Any]] = []  # collects per-doc compression stats
+        ui_turn_details: List[Dict[str, Any]] = []  # enriched trace, only populated when trace_mode=True
 
         while turn < self.max_turns:
             logger.info(f"Turn {turn + 1}: Planning for query: {current_query}")
@@ -156,41 +198,126 @@ class OmniSearch:
                     if doc_id in self.corpus:
                         docs_for_verify.append({"id": doc_id, "text": self.corpus[doc_id]})
 
+                # --- Plug-and-play compression ---
+                # When compression_enabled=False this block is skipped entirely;
+                # the original [:8000] truncation inside verifier.py acts as fallback.
+                subq_compression: List[Dict[str, Any]] = []
+                if self.compression_enabled:
+                    compressed_results = await asyncio.gather(*[
+                        self.compressor.compress_doc(sub_q, d["id"], d["text"])
+                        for d in docs_for_verify
+                    ])
+                    for r in compressed_results:
+                        compression_log.append({
+                            "turn": turn + 1,
+                            "sub_query": sub_q,
+                            "doc_id": r["doc_id"],
+                            "orig_words": r["orig_words"],
+                            "comp_words": r["comp_words"],
+                            "ratio": r["ratio"],
+                        })
+                        if trace_mode:
+                            subq_compression.append({
+                                "doc_id": r["doc_id"],
+                                "orig_words": r["orig_words"],
+                                "comp_words": r["comp_words"],
+                                "ratio": r["ratio"],
+                            })
+                    docs_for_verify = [
+                        {"id": r["doc_id"], "text": r["compressed_text"]}
+                        for r in compressed_results
+                        if r["compressed_text"].strip()
+                    ]
+
                 verification = await self.verifier.verify(sub_q, docs_for_verify)
                 verification["sub_query"] = sub_q
+
+                if trace_mode:
+                    return {
+                        "verification": verification,
+                        "retrieval_counts": {
+                            "bm25": len(multi_results.get("bm25", [])),
+                            "vector": len(multi_results.get("vector", [])),
+                            "entity": len(multi_results.get("entity", [])),
+                            "ontology": len(multi_results.get("ontology", [])),
+                        },
+                        "ranked_top10": [
+                            {
+                                "id": str(d["id"]),
+                                "score": round(float(d["score"]), 4),
+                                "text_preview": self.corpus.get(str(d["id"]), "")[:300],
+                            }
+                            for d in ranked_docs[:10]
+                        ],
+                        "compression_stats": subq_compression,
+                    }
                 return verification
 
             tasks = [_process_subq(sq) for sq in sub_queries]
             turn_results = await asyncio.gather(*tasks)
+
+            # When trace_mode=True, turn_results contains enriched dicts; extract verifications.
+            # When trace_mode=False, turn_results is the original list of verification dicts.
+            if trace_mode:
+                verifications = [r["verification"] for r in turn_results]
+                ui_turn_details.append({
+                    "turn": turn + 1,
+                    "main_query": current_query,
+                    "plan": {
+                        "sub_queries": sub_queries,
+                        "intent": plan.get("intent", ""),
+                        "rewritten_query": plan.get("rewritten_query", current_query),
+                    },
+                    "sub_queries": [
+                        {
+                            "sub_query": r["verification"].get("sub_query", ""),
+                            "retrieval_counts": r["retrieval_counts"],
+                            "ranked_top10": r["ranked_top10"],
+                            "compression_stats": r["compression_stats"],
+                            "verifier_result": r["verification"],
+                        }
+                        for r in turn_results
+                    ],
+                })
+            else:
+                verifications = turn_results
+
+            # Original turn_trace_details format — unchanged regardless of trace_mode
             turn_trace_details.append({
                 "turn": turn + 1,
                 "main_query": current_query,
                 "sub_queries": [
                     {
-                        "sub_query": verification.get("sub_query", ""),
-                        "verifier_result": verification,
+                        "sub_query": v.get("sub_query", ""),
+                        "verifier_result": v,
                     }
-                    for verification in turn_results
+                    for v in verifications
                 ],
             })
 
-            for verification in turn_results:
+            for verification in verifications:
                 all_evidences.extend(verification.get("evidences_chain", []))
                 all_doc_ids.update(verification.get("keep_ids", []))
-            
+
             # Reflect on the current turn's results using the query that was planned/executed this turn
             # Provide original query, current (rewritten) query, verifier results and accumulated evidences
-            reflection = await self.reflector.reflect(query, current_query, turn_results, all_evidences)
+            reflection = await self.reflector.reflect(query, current_query, verifications, all_evidences)
             last_reflection = reflection
+            if trace_mode:
+                ui_turn_details[-1]["reflection"] = {
+                    "answered": reflection.get("answered", False),
+                    "thought": reflection.get("thought", ""),
+                    "new_query": reflection.get("new_query", ""),
+                }
             if reflection.get("answered"):
                 logger.info("Query fully answered.")
                 # persist trace for answered requests as well
                 try:
-                    self._persist_query_traces(request_id, trace_queries, turn_trace_details)
+                    self._persist_query_traces(request_id, trace_queries, turn_trace_details, compression_log)
                 except Exception:
                     logger.warning("Failed to write query trace for answered request")
 
-                return {
+                result = {
                     "query": query,
                     "answer": reflection.get("final_answer"),
                     "evidences": all_evidences,
@@ -198,6 +325,9 @@ class OmniSearch:
                     "doc_ids": list(all_doc_ids),
                     "turns": turn + 1,
                 }
+                if trace_mode:
+                    result["turn_details"] = ui_turn_details
+                return result
             # Update current_query to the new query suggested by reflector (defaults to previous current_query)
             current_query = reflection.get("new_query", current_query)
             turn += 1
@@ -205,7 +335,7 @@ class OmniSearch:
         forced_final = await self.reflector.force_answer(
             query,
             current_query,
-            turn_results if 'turn_results' in locals() else [],
+            verifications if 'verifications' in locals() else [],
             all_evidences,
         )
         final_ans = (
@@ -219,10 +349,10 @@ class OmniSearch:
         )
         # persist trace: one line per request with id first
         try:
-            self._persist_query_traces(request_id, trace_queries, turn_trace_details)
+            self._persist_query_traces(request_id, trace_queries, turn_trace_details, compression_log)
         except Exception:
             logger.warning("Failed to write query trace")
-        return {
+        result = {
             "query": query,
             "answer": final_ans,
             "evidences": all_evidences,
@@ -230,12 +360,16 @@ class OmniSearch:
             "doc_ids": list(all_doc_ids),
             "turns": turn,
         }
+        if trace_mode:
+            result["turn_details"] = ui_turn_details
+        return result
 
     def _persist_query_traces(
         self,
         request_id: Optional[str],
         trace_queries: List[str],
         turn_trace_details: List[Dict[str, Any]],
+        compression_log: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         os.makedirs(self.storage_dir, exist_ok=True)
         rid = str(request_id) if request_id is not None else "unknown"
@@ -249,3 +383,9 @@ class OmniSearch:
         with open(detail_trace_path, "a", encoding="utf-8") as tf:
             ordered = {"id": rid, "turns": turn_trace_details}
             tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+
+        if compression_log:
+            comp_path = os.path.join(self.storage_dir, "compression_stats.jsonl")
+            with open(comp_path, "a", encoding="utf-8") as cf:
+                for entry in compression_log:
+                    cf.write(json.dumps({"request_id": rid, **entry}, ensure_ascii=False) + "\n")
